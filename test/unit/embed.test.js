@@ -118,7 +118,7 @@ test('related returns vector neighbours without a reranker', async () => {
 
   const result = await service.related('n1', { limit: 5 });
 
-  assert.deepEqual(result, { ok: true, reranked: false, items: neighbours });
+  assert.deepEqual(result, { ok: true, reranked: false, embedModel: 'fake-embed', items: neighbours });
   assert.equal(calls.nearest[0].excludeNoteId, 'n1', 'a note is never its own neighbour');
   assert.ok(calls.nearest[0].limit >= 10, 'it fetches more candidates than the caller asked for');
 });
@@ -129,7 +129,12 @@ test('related uses the reranker when there is one, and keeps the vector answer w
   const withRerank = harness({ nearest: neighbours, withRerankRole: true });
   const reranked = await withRerank.service.related('n1');
   assert.equal(reranked.reranked, true);
-  assert.deepEqual(reranked.items, [{ id: 'n2', title: 'B', score: 88, reason: 'same subject' }]);
+  assert.equal(reranked.rerankModel, 'fake-rerank');
+  // The reranker supplies score and reason; the measured distance and the snippet
+  // it was shown stay on the hit instead of being replaced by them.
+  assert.deepEqual(reranked.items, [{
+    id: 'n2', kind: 'note', title: 'B', snippet: 's', similarity: 0.91, score: 88, reason: 'same subject',
+  }]);
 
   const failing = harness({ nearest: neighbours, withRerankRole: true, rerankThrows: true });
   const fallback = await failing.service.related('n1');

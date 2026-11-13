@@ -18,7 +18,7 @@ const auth = { authorization: `Bearer ${TOKEN}` };
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function fakeProviders({ configured = true, withEmbed = true, withRerank = false } = {}) {
+function fakeProviders({ configured = true, withEmbed = true, withRerank = false, rerankThrows = false } = {}) {
   const summarize = async () => ({ tags: ['quantum', 'film'], summary: 'Over qubits en film.' });
   const summary = configured
     ? { baseUrl: 'https://api.example.com/v1', model: 'fake-summary', summarize }
@@ -40,9 +40,11 @@ function fakeProviders({ configured = true, withEmbed = true, withRerank = false
     ? {
       baseUrl: 'https://api.example.com/v1',
       model: 'fake-rerank',
-      rerank: async (note, candidates) => candidates
-        .slice(0, 1)
-        .map((c) => ({ id: c.id, title: c.title, score: 97, reason: 'fake rerank' })),
+      rerank: rerankThrows
+        ? async () => { throw new Error('rerank exploded'); }
+        : async (note, candidates) => candidates
+          .slice(0, 1)
+          .map((c) => ({ id: c.id, title: c.title, score: 97, reason: 'fake rerank' })),
     }
     : null;
 
@@ -58,7 +60,7 @@ function fakeProviders({ configured = true, withEmbed = true, withRerank = false
   };
 }
 
-async function boot({ withProvider = true, withEmbed = true, withRerank = false } = {}) {
+async function boot({ withProvider = true, withEmbed = true, withRerank = false, rerankThrows = false } = {}) {
   const pool = createPool({ connectionString: DATABASE_URL, max: 4 });
   await migrate({ pool, logger: { log() {} } });
   await pool.query('TRUNCATE notes CASCADE');
@@ -70,7 +72,7 @@ async function boot({ withProvider = true, withEmbed = true, withRerank = false 
     port: 0,
     host: '127.0.0.1',
   };
-  const providers = fakeProviders({ configured: withProvider, withEmbed, withRerank });
+  const providers = fakeProviders({ configured: withProvider, withEmbed, withRerank, rerankThrows });
   const { app } = createServer({ config, pool, providers, logger: { error() {}, warn() {} } });
   return { app, pool };
 }
@@ -257,4 +259,69 @@ test('deleting a note takes its derived items with it', async (t) => {
 
   const { rows } = await pool.query('SELECT count(*)::int AS n FROM derived_items WHERE id = $1::uuid', [derived.items[0].id]);
   assert.equal(rows[0].n, 0, 'the cascade holds');
+});
+
+test('related needs vectors: with no embed role it says so instead of guessing', async (t) => {
+  const { app, pool } = await boot({ withEmbed: false });
+  t.after(async () => { await app.close(); await pool.end(); });
+
+  const note = (await app.inject({ method: 'POST', url: '/api/notes', headers: auth, payload: { title: 'Kwantum' } })).json();
+  const res = await app.inject({ method: 'GET', url: `/api/notes/${note.id}/related`, headers: auth });
+
+  assert.equal(res.statusCode, 501);
+  assert.deepEqual(res.json().missing, ['EMBED_BASE_URL', 'EMBED_MODEL']);
+});
+
+test('related orders by distance without a reranker, and the query note needs no vector of its own', async (t) => {
+  const { app, pool } = await boot({ withRerank: false, withEmbed: true });
+  t.after(async () => { await app.close(); await pool.end(); });
+
+  const make = async (payload) => (await app.inject({ method: 'POST', url: '/api/notes', headers: auth, payload })).json();
+  const query = await make({ title: 'Kwantum', body: 'qubits' }); // deliberately never embedded
+  const near = await make({ title: 'Kwantum extra', body: 'kwantum qubits' });
+  const far = await make({ title: 'Boodschappen', body: 'boodschappen melk' });
+  for (const note of [near, far]) {
+    assert.equal((await app.inject({ method: 'POST', url: `/api/notes/${note.id}/embed`, headers: auth })).statusCode, 201);
+  }
+
+  const body = (await app.inject({ method: 'GET', url: `/api/notes/${query.id}/related`, headers: auth })).json();
+  assert.equal(body.reranked, false);
+  assert.equal(body.embedModel, 'fake-embed');
+  assert.equal(body.items[0].id, near.id, 'the identical vector ranks first');
+  assert.ok(body.items[0].similarity > 0.99, 'the distance comes back with the hit');
+  assert.equal(body.items[1].id, far.id);
+});
+
+test('a reranker adds a why without erasing the distance underneath it', async (t) => {
+  const { app, pool } = await boot({ withRerank: true });
+  t.after(async () => { await app.close(); await pool.end(); });
+
+  const make = async (payload) => (await app.inject({ method: 'POST', url: '/api/notes', headers: auth, payload })).json();
+  const query = await make({ title: 'Kwantum', body: 'qubits' });
+  const near = await make({ title: 'Kwantum extra', body: 'kwantum qubits' });
+  await app.inject({ method: 'POST', url: `/api/notes/${near.id}/embed`, headers: auth });
+
+  const body = (await app.inject({ method: 'GET', url: `/api/notes/${query.id}/related`, headers: auth })).json();
+  assert.equal(body.reranked, true);
+  assert.equal(body.rerankModel, 'fake-rerank');
+  assert.equal(body.items[0].id, near.id, 'a reranker cannot introduce an id that was not a candidate');
+  assert.equal(body.items[0].score, 97);
+  assert.equal(body.items[0].reason, 'fake rerank');
+  assert.ok(body.items[0].similarity > 0.99, 'the measured distance survives the rerank');
+  assert.ok(body.items[0].snippet, 'and so does the snippet the reranker was shown');
+});
+
+test('a reranker that fails falls back to the vector order and says why', async (t) => {
+  const { app, pool } = await boot({ withRerank: true, rerankThrows: true });
+  t.after(async () => { await app.close(); await pool.end(); });
+
+  const make = async (payload) => (await app.inject({ method: 'POST', url: '/api/notes', headers: auth, payload })).json();
+  const query = await make({ title: 'Kwantum', body: 'qubits' });
+  const near = await make({ title: 'Kwantum extra', body: 'kwantum qubits' });
+  await app.inject({ method: 'POST', url: `/api/notes/${near.id}/embed`, headers: auth });
+
+  const body = (await app.inject({ method: 'GET', url: `/api/notes/${query.id}/related`, headers: auth })).json();
+  assert.equal(body.reranked, false);
+  assert.match(body.rerankError, /rerank exploded/);
+  assert.equal(body.items[0].id, near.id, 'the vector answer is still underneath');
 });

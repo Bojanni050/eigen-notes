@@ -178,6 +178,11 @@ export function createRoutes({ notes, derived, embeddings, providers, derive, em
           return {
             items: result.items,
             reranked: result.reranked,
+            // Provenance: which models produced this answer. A client that shows a
+            // list of neighbours should be able to say what made it, and `rerankError`
+            // is how it learns that the model part did not happen.
+            ...(result.embedModel ? { embedModel: result.embedModel } : {}),
+            ...(result.rerankModel ? { rerankModel: result.rerankModel } : {}),
             ...(result.rerankError ? { rerankError: result.rerankError } : {}),
           };
         }

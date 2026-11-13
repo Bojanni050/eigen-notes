@@ -70,16 +70,22 @@ export function createEmbedService({ notes, embeddings, providers, config, logge
 
     const rerankRole = providers.role('related');
     if (!rerankRole || candidates.length === 0) {
-      return { ok: true, reranked: false, items: candidates.slice(0, limit) };
+      return { ok: true, reranked: false, embedModel: embedRole.model, items: candidates.slice(0, limit) };
     }
 
     try {
       const reranked = await rerankRole.rerank(note, candidates);
-      return { ok: true, reranked: true, items: reranked.slice(0, limit) };
+      // The reranker adds a why; it must not erase what the vector search already
+      // measured. Each item keeps the similarity and snippet it came in with (the
+      // model only supplies score and reason), so a client can show the measured
+      // distance next to the model's judgement instead of one replacing the other.
+      const byId = new Map(candidates.map((c) => [c.id, c]));
+      const items = reranked.slice(0, limit).map((item) => ({ ...byId.get(item.id), ...item }));
+      return { ok: true, reranked: true, embedModel: embedRole.model, rerankModel: rerankRole.model, items };
     } catch (err) {
       // A reranker that fails must not lose the vector answer underneath it.
       logger.warn?.(`[embed] rerank failed for ${note.id}: ${err.message}`);
-      return { ok: true, reranked: false, rerankError: err.message, items: candidates.slice(0, limit) };
+      return { ok: true, reranked: false, rerankError: err.message, embedModel: embedRole.model, items: candidates.slice(0, limit) };
     }
   }
 
