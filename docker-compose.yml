@@ -1,0 +1,129 @@
+services:
+  db:
+    # pgvector's own image — the extension is what makes `related` a database
+    # query instead of "send every note to a model and hope".
+    image: pgvector/pgvector:pg16
+    container_name: eigen-notes-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-eigen_notes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eigen_notes}
+      POSTGRES_DB: ${POSTGRES_DB:-eigen_notes}
+    ports:
+      # 5433 on purpose: this host already runs another Postgres on 5432, and
+      # this stack must not collide with anything that is already there.
+      - "${POSTGRES_HOST:-127.0.0.1}:5433:5432"
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eigen_notes} -d ${POSTGRES_DB:-eigen_notes}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Two llama.cpp servers, this app's OWN: one for chat (tags/summary, rerank),
+  # one for embeddings. They do not talk to, and do not touch, any other model
+  # server on this host — own containers, own volume, own ports.
+  #
+  # Embeddings get their own process because llama.cpp serves one model per
+  # server, and because a BERT-style embedding model must run in embedding mode
+  # with CLS pooling (bge-m3's recommendation), which is not a chat server.
+  llm-chat:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: eigen-notes-llm-chat
+    restart: unless-stopped
+    command:
+      - -m
+      - /models/qwen2.5-3b-instruct-q4_k_m.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --ctx-size
+      - "8192"
+      - --jinja
+    ports:
+      # Published only so a local `npm start` can reach this app's models.
+      - "127.0.0.1:11500:8080"
+    volumes:
+      - models:/models:ro
+    depends_on:
+      models:
+        condition: service_completed_successfully
+
+  llm-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: eigen-notes-llm-embed
+    restart: unless-stopped
+    command:
+      - -m
+      - /models/bge-m3-Q8_0.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --embeddings
+      - --pooling
+      - cls
+    ports:
+      - "127.0.0.1:11501:8080"
+    volumes:
+      - models:/models:ro
+    depends_on:
+      models:
+        condition: service_completed_successfully
+
+  # Downloads the two GGUF files once, into this stack's own volume. The logic
+  # lives in scripts/fetch-models.sh (idempotent, so a second `up` is cheap) —
+  # not inline here, because compose mangles a multi-line command string badly
+  # enough that the first version silently ran no download at all.
+  models:
+    image: curlimages/curl:latest
+    container_name: eigen-notes-models
+    user: "0"
+    restart: "no"
+    entrypoint: ["/bin/sh", "/scripts/fetch-models.sh"]
+    volumes:
+      - models:/models
+      - ./scripts:/scripts:ro
+
+  api:
+    build: .
+    container_name: eigen-notes-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-eigen_notes}:${POSTGRES_PASSWORD:-eigen_notes}@db:5432/${POSTGRES_DB:-eigen_notes}
+      # Container addresses, fixed here so a host-oriented .env can never point
+      # the container at the wrong host. Model names come from .env because they
+      # are the same inside and outside Docker.
+      #
+      # API_HOST in particular: a container must bind 0.0.0.0 and let the port
+      # publish do the restricting. Binding the .env's 127.0.0.1 inside the
+      # container makes the published port answer with "connection reset".
+      API_HOST: 0.0.0.0
+      API_PORT: 8899
+      LLM_BASE_URL: http://llm-chat:8080/v1
+      SUMMARY_BASE_URL: http://llm-chat:8080/v1
+      RELATED_BASE_URL: http://llm-chat:8080/v1
+      EMBED_BASE_URL: http://llm-embed:8080/v1
+      SUMMARY_MODEL: ${SUMMARY_MODEL:-qwen2.5-3b-instruct}
+      RELATED_MODEL: ${RELATED_MODEL:-qwen2.5-3b-instruct}
+      EMBED_MODEL: ${EMBED_MODEL:-bge-m3}
+      EMBED_DIMENSIONS: ${EMBED_DIMENSIONS:-1024}
+      EMBED_MAX_CHARS: ${EMBED_MAX_CHARS:-8000}
+    ports:
+      # Loopback by default — put it behind Tailscale or a TLS proxy before it
+      # ever listens on a public interface. Auth is a bearer token.
+      - "${API_HOST:-127.0.0.1}:${API_PORT:-8899}:${API_PORT:-8899}"
+    depends_on:
+      db:
+        condition: service_healthy
+      llm-chat:
+        condition: service_started
+      llm-embed:
+        condition: service_started
+    command: sh -c "node src/db/migrate.js && node src/http/server.js"
+
+volumes:
+  models:

@@ -1,0 +1,21 @@
+{
+  "name": "eigen-notes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A personal notes app: notes are objects with a kind, AI output is derived and never overwrites them.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/http/server.js",
+    "migrate": "node src/db/migrate.js",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
+    "test": "npm run test:unit && npm run test:integration"
+  },
+  "dependencies": {
+    "fastify": "^5.2.1",
+    "pg": "^8.13.1"
+  }
+}
