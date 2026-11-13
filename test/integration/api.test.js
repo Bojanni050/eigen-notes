@@ -8,7 +8,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createPool } from '../../src/db/pool.js';
+import path from 'node:path';
+import os from 'node:os';
+import { createDatabase } from '../../src/db/index.js';
 import { migrate } from '../../src/db/migrate.js';
 import { createServer } from '../../src/http/server.js';
 
@@ -17,6 +19,16 @@ const TOKEN = 'test-token';
 const auth = { authorization: `Bearer ${TOKEN}` };
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Which backend this suite runs on. A DATABASE_URL means there is a Postgres to
+ * talk to; with none there is nothing to install, so the suite runs on PGlite in
+ * a throwaway directory — the same migrations, the same SQL, the same tests. That
+ * is what makes `npm test` work on a bare checkout, Windows included.
+ */
+const BACKEND = process.env.DB_BACKEND || (process.env.DATABASE_URL ? 'postgres' : 'pglite');
+const PGLITE_DIR = process.env.PGLITE_DIR || path.join(os.tmpdir(), `eigen-notes-test-${process.pid}`);
+const backendArgs = () => (BACKEND === 'pglite' ? { backend: 'pglite', dir: PGLITE_DIR } : { backend: 'postgres', url: DATABASE_URL });
 
 function fakeProviders({ configured = true, withEmbed = true, withRerank = false, rerankThrows = false } = {}) {
   const summarize = async () => ({ tags: ['quantum', 'film'], summary: 'Over qubits en film.' });
@@ -61,7 +73,7 @@ function fakeProviders({ configured = true, withEmbed = true, withRerank = false
 }
 
 async function boot({ withProvider = true, withEmbed = true, withRerank = false, rerankThrows = false } = {}) {
-  const pool = createPool({ connectionString: DATABASE_URL, max: 4 });
+  const pool = await createDatabase(backendArgs());
   await migrate({ pool, logger: { log() {} } });
   await pool.query('TRUNCATE notes CASCADE');
 
@@ -88,7 +100,7 @@ test('health is open; everything under /api needs the token', async (t) => {
 });
 
 test('with no token configured the API refuses everything (fail closed)', async (t) => {
-  const pool = createPool({ connectionString: DATABASE_URL, max: 2 });
+  const pool = await createDatabase({ ...backendArgs() });
   const { app } = createServer({
     config: { tokens: [], summaryMaxChars: 100, port: 0, host: '127.0.0.1' },
     pool,

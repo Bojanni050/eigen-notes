@@ -21,9 +21,9 @@ in plaats van één hardcoded model, en auth vanaf het begin.
 
 ## Draaien
 
-Alles staat in de eigen stack: Postgres 16 + pgvector, twee llama.cpp-servers en
-de app. Eén commando, en bij de eerste start worden de twee modellen (~2,5 GB)
-gedownload — daarna is het idempotent.
+Drie routes, alle drie met dezelfde app-code en dezelfde modellen. Kies er één.
+
+**1. Alles in Docker** (een commando, niets anders nodig dan Docker):
 
 ```bash
 cp .env.example .env          # zet NOTES_TOKEN erin
@@ -31,14 +31,24 @@ docker compose up -d          # db + llm-chat + llm-embed + models + api
 open http://127.0.0.1:8899    # of curl; alles behalve /health vraagt de token
 ```
 
-Zonder Docker, met dezelfde servers maar dan vanuit de repo:
+Bij de eerste start worden de twee modellen (~2,5 GB) in het eigen volume
+gedownload; daarna is het idempotent.
+
+**2. Native op Linux/macOS** (geen Docker; llama.cpp en Node lokaal):
 
 ```bash
-docker compose up -d db llm-chat llm-embed models
-npm ci && npm run migrate
-LLM_BASE_URL=http://127.0.0.1:11500/v1 \
-EMBED_BASE_URL=http://127.0.0.1:11501/v1 npm start
+npm ci
+./scripts/fetch-llama-server.sh   # llama.cpp voor deze machine, vastgepinde tag
+./scripts/serve-models.sh         # start beide modelservers op 11500/11501
+cp .env.example .env              # DB_BACKEND=pglite hoeft geen server te hebben
+npm run start:local               # leest .env via node --env-file-if-exists
 ```
+
+Modellen? Of ze uit het Docker-volume halen (zie `scripts/serve-models.sh`), of
+`MODELS_DIR` naar een map met de twee GGUF-bestanden wijzen.
+
+**3. Windows** — zie [Windows](#windows) hieronder: één script,
+`.\start-windows.ps1`, regelt Node-controle, modellen, llama.cpp en de app.
 
 ### De modelservers
 
@@ -51,10 +61,11 @@ embedding-model hoort in embedding-modus met CLS-pooling:
 | chat | `qwen2.5-3b-instruct` (Q4_K_M GGUF) | tags + samenvatting, en de rerank die per treffer een reden geeft |
 
 Geen Ollama, geen daemon met een eigen model-registry: één binary en een
-GGUF-bestand, wat ook de weg is naar een Windows-build waarin je alleen die twee
-bestanden meelevert. Een model wisselen = de URL in de `models`-service én het
-`-m /models/...`-pad van die server aanpassen; de app meldt daarna eerlijk welke
-rollen er zijn via `GET /api/meta`.
+GGUF-bestand. Dat is precies waarom de Windows-versie alleen die twee bestanden
+hoeft te downloaden (`scripts/fetch-llama-server.ps1`, vastgepinde tag) in plaats
+van een model-runtime te installeren. Een model wisselen = de download in
+`scripts/fetch-models.sh`/`.ps1` én het `-m`-pad in de serveerscripts aanpassen;
+de app meldt daarna eerlijk welke rollen er zijn via `GET /api/meta`.
 
 Deze stack raakt niets anders op de host: eigen containers, eigen volume, eigen
 poorten (11500/11501 alleen op loopback, voor een lokale run).
@@ -74,13 +85,62 @@ CREATE INDEX note_embeddings_hnsw_idx
 Beide statements zijn op een proeftabel geverifieerd. Zonder index werkt `related`
 nog steeds; het is een seq-scan over je eigen corpus in plaats van een ANN-zoek.
 
-Alles in één keer, inclusief de app in een container:
+## Database: Postgres of PGlite
 
-```bash
-docker compose up -d --build
+De app heeft één database-interface (`query`, `transaction`, `end`), en daar zijn
+twee implementaties op: `postgres` (de compose-stack, of elke echte server) en
+`pglite` — dezelfde Postgres, naar wasm gecompileerd, in één map op schijf, zonder
+iets te installeren.
+
+```
+DB_BACKEND=postgres    # DATABASE_URL doet de rest
+DB_BACKEND=pglite      # DB_DIR=./data/pglite, klaar
 ```
 
-Node 22 is vereist (deze host heeft 18). Zonder Node 22:
+PGlite is Postgres 18 met **pgvector** en **pg_trgm** erbij geladen, dus alle vier
+de migraties, de full-text search, de `updated_at`-trigger en het vectorzoeken met
+`<=>` werken er onveranderd op. Wat er niet werkt is de HNSW-index op een
+dimensieloze kolom — precies zoals op een echte server (`column does not have
+dimensions`), dus dezelfde eenmalige `ALTER` hierboven geldt voor beide.
+
+Eén ding om te weten: een relatieve `DB_DIR` hangt aan de map waarin je start.
+Draai je de app vanuit een map waar je geen schrijfrechten hebt (bijvoorbeeld een
+`data/` die eerder door Docker als root is aangemaakt), zet `DB_DIR` dan ergens
+anders.
+
+## Windows
+
+Downloaden, uitpakken, één script:
+
+```powershell
+.\start-windows.ps1
+```
+
+Dat script doet de hele rij en slaat over wat er al staat, dus een tweede keer
+starten is snel:
+
+1. controleert Node (22 of nieuwer) en zegt waar je het haalt als het ontbreekt;
+2. `npm ci`;
+3. schrijft `.env` als die er nog niet is — met een **gegenereerd** token in plaats
+   van een bekend voorbeeldtoken, en `DB_BACKEND=pglite` zodat er geen Postgres
+   nodig is;
+4. haalt de twee modellen op (~2,5 GB) en een llama.cpp-build voor Windows;
+5. start beide modelservers en wacht tot ze antwoorden;
+6. start de app op `http://127.0.0.1:8899`.
+
+Ctrl-C stopt de app en beide modelservers. Losse onderdelen:
+`.\scripts\fetch-models.ps1`, `.\scripts\fetch-llama-server.ps1 -Variant vulkan`
+(ook `cuda-13.5`, `cuda-12.4`, `sycl`), `.\scripts\serve-models.ps1`.
+
+Wat hieraan **geverifieerd** is en wat niet, want dat verschil hoort er te staan:
+het PGlite-pad, de bash-scripts en de hele keten eroverheen zijn op Linux
+end-to-end gedraaid (migraties, derive, embed, related, herstart en persistentie);
+de PowerShell-scripts zijn gecontroleerd op syntaxis onder pwsh 7.4.2 en de
+`.env`-generatie is los getest, maar Windows zelf is nog niet gedraaid. De
+zip-structuur van de llama.cpp-release (`llama-server.exe` op het hoogste niveau)
+is wel echt nagekeken.
+
+Node 22 is vereist voor alles (deze host heeft 18). Zonder Node 22 op de host:
 
 ```bash
 docker run --rm -v "$PWD":/app -w /app node:22-alpine npm test
@@ -101,6 +161,8 @@ geconfigureerd token weigert de API elk verzoek (fail closed).
 | PATCH | `/api/notes/:id` | titel/body/tags/kind |
 | DELETE | `/api/notes/:id` | weg |
 | POST | `/api/notes/:id/derive` | vraagt de summary-rol om tags + samenvatting; schrijft naar `derived_items` |
+| POST | `/api/notes/:id/embed` | laat de embed-rol een vector maken en bewaart die naast de notitie |
+| GET | `/api/notes/:id/related` | buren op afstand, en met de `related`-rol ook per treffer een reden |
 | POST | `/api/derived/:id/accept` · `/dismiss` | jouw oordeel over afgeleide uitvoer |
 
 Zoeken filtert, recentheid ordent: `q` matcht full-text én substring, maar de
@@ -111,10 +173,16 @@ met een keyset-cursor (`next_cursor` in het antwoord).
 
 ```bash
 npm run test:unit          # geen database nodig
-npm run test:integration   # vereist DATABASE_URL naar een lege database
+npm run test:integration   # DATABASE_URL = echte Postgres, zonder = PGlite
+npm run test:pglite        # forceert PGlite
 ```
 
-Unit-tests dekken de cursor, de rolresolutie en de derivatie-service (met een
-nep-provider). De integratietests praten met een echte Postgres via
-`app.inject()` — inclusief de invariant die er het meest toe doet: na een
-derivatie is de notitie zelf byte-identiek.
+Unit-tests dekken de cursor, de rolresolutie, de providers en de embed-service
+(met nep-providers). De integratietests draaien de **echte** server via
+`app.inject()` tegen een echte database: alle migraties, de `updated_at`-trigger,
+de keyset-cursor, de auth-hook en de invariant die er het meest toe doet — na een
+derivatie is de notitie zelf byte-identiek, ook met een reranker ernaast.
+
+Staat `DATABASE_URL` niet gezet, dan pakt de suite PGlite in een tijdelijke map:
+dezelfde 13 tests, dezelfde SQL, geen server om te installeren. Dat is wat
+`npm test` op een verse checkout laat werken, Windows inbegrepen.

@@ -2,7 +2,7 @@ import { pathToFileURL } from 'node:url';
 import Fastify from 'fastify';
 
 import { loadConfig } from '../config.js';
-import { createPool } from '../db/pool.js';
+import { createDatabase } from '../db/index.js';
 import { createNotesRepo } from '../repo/notes.js';
 import { createDerivedRepo } from '../repo/derived.js';
 import { createEmbeddingsRepo } from '../repo/embeddings.js';
@@ -14,7 +14,9 @@ import { createRoutes } from './routes.js';
 
 /**
  * Everything is injected, so tests run the real server against a scratch
- * database and a fake provider without a single process.env write.
+ * database and a fake provider without a single process.env write. The database
+ * is whatever createDatabase returns — Postgres or PGlite — because all the code
+ * below only ever calls query/transaction/end.
  */
 export function createServer({ config, pool, providers, logger = console }) {
   const notes = createNotesRepo({ pool });
@@ -38,7 +40,7 @@ export function createServer({ config, pool, providers, logger = console }) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = loadConfig();
-  const pool = createPool({ connectionString: config.databaseUrl });
+  const pool = await createDatabase(config.database);
   const providers = createProviders();
   const { app } = createServer({ config, pool, providers });
 
@@ -54,6 +56,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   await app.listen({ port: config.port, host: config.host });
   const roles = providers.capabilities();
   console.log(`[eigen-notes] listening on http://${config.host}:${config.port}`);
+  // Say which database, because "postgres" and "pglite" fail in different ways
+  // and the log is the first place anyone looks.
+  console.log(`[eigen-notes] db: ${pool.backend}${pool.backend === 'pglite' ? ` at ${config.database.dir}` : ''}`);
   console.log(`[eigen-notes] roles: ${Object.entries(roles).map(([r, on]) => `${r}=${on ? 'on' : 'off'}`).join(' ')}`);
   if (config.tokens.length === 0) {
     console.warn('[eigen-notes] NOTES_TOKEN is empty — every request gets 503 until it is set');

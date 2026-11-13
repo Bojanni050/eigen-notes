@@ -5,3 +5,9 @@ node_modules/
 *.log
 coverage/
 data/
+# Local runtime artifacts: a fetched llama.cpp build and downloaded models.
+# Gigabytes, machine-specific, and re-fetched by the scripts under scripts/.
+# No trailing slash on purpose: a local run may leave a symlink here, and `dir/`
+# only matches a directory.
+/runtime
+/models
